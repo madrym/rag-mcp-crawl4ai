@@ -1,0 +1,11 @@
+# Main dependencies
+crawl4ai==0.6.2
+mcp==1.7.1
+openai==1.71.0
+dotenv==0.9.9
+psycopg2-binary
+boto3
+
+# Testing dependencies
+pytest
+requests-mock 

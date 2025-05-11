@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudFormation template to deploy a VPC, subnets, and an AWS RDS PostgreSQL instance
+  for the MCP Crawl4AI server, with a security group and a Secrets Manager secret
+  for credentials. Deploys into ap-southeast-2.
+
+Parameters:
+  AccessCIDR:
+    Type: String
+    Description: >-
+      IP CIDR range allowed to access the RDS instance (e.g., your VPN or office IP /32 for development).
+      Required for access.
+    Default: "" # Will be passed at runtime
+    ConstraintDescription: Must be a valid IP CIDR block in format x.x.x.x/x
+  DBInstanceIdentifier:
+    Type: String
+    Description: Identifier for the RDS PostgreSQL instance.
+    Default: mcp-crawl4ai-rds
+  DBName:
+    Type: String
+    Description: Initial database name on the RDS instance.
+    Default: crawl4ai_db
+  DBMasterUsername:
+    Type: String
+    Description: Master username for the RDS database.
+    Default: mcp_admin
+    NoEcho: true
+  DBMasterUserPassword:
+    Type: String
+    Description: Master password for the RDS database. Min 8 characters.
+    NoEcho: true
+    MinLength: 8
+    AllowedPattern: "[a-zA-Z0-9!#%&'()*+,-./:;<=>?@\\[\\]^_`{|}~]*"
+    ConstraintDescription: Must contain only printable ASCII characters except \" / @ ' space.
+  DBInstanceClass:
+    Type: String
+    Description: RDS instance class (e.g., db.t3.medium, db.m5.large).
+    Default: db.t3.micro
+  DBAllocatedStorage:
+    Type: Number
+    Description: Allocated storage in GB for the RDS instance.
+    Default: 20
+  PostgresEngineVersion:
+    Type: String
+    Description: PostgreSQL engine version
+    Default: "17.5" # Check AWS for latest supported versions for pgvector
+  EnableIAMDatabaseAuthentication:
+    Type: String
+    Description: Enable IAM database authentication for the RDS instance.
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+  BackupRetentionPeriod:
+    Type: Number
+    Description: The number of days to retain automated backups.
+    Default: 7
+  MultiAZDeployment:
+    Type: String
+    Description: Specifies if the DB instance is a Multi-AZ deployment.
+    Default: "false" # Set to true for production for higher availability
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  HasAccessCIDR: !Not [!Equals [!Ref AccessCIDR, ""]]
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: mcp-crawl4ai-vpc
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: mcp-crawl4ai-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: mcp-crawl4ai-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Private Subnet A (ap-southeast-2a)
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: ap-southeast-2a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: mcp-crawl4ai-private-a
+
+  # Private Subnet B (ap-southeast-2b)
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: ap-southeast-2b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: mcp-crawl4ai-private-b
+
+  # Associate subnets with public route table (for RDS PubliclyAccessible)
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for MCP Crawl4AI RDS instance
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${DBInstanceIdentifier}-subnet-group"
+
+  # Security Group for RDS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MCP Crawl4AI RDS instance
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${DBInstanceIdentifier}-sg"
+
+  # Ingress rule for user's home IP
+  RDSSecurityGroupIngressFromCIDR:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasAccessCIDR
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Ref AccessCIDR
+      Description: "Home IP Access"
+
+  # RDS Instance
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      DBName: !Ref DBName
+      Engine: postgres
+      EngineVersion: !Ref PostgresEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterUserPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: true
+      EnableIAMDatabaseAuthentication: !Ref EnableIAMDatabaseAuthentication
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      MultiAZ: !Ref MultiAZDeployment
+      StorageEncrypted: true
+      DeletionProtection: false
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Ref DBInstanceIdentifier
+        - Key: Application
+          Value: MCP-Crawl4AI
+
+  # Secrets Manager Secret
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "mcp/crawl4ai/${DBInstanceIdentifier}/db_credentials"
+      Description: !Sub "Credentials for RDS instance ${DBInstanceIdentifier}"
+      SecretString: !Sub
+        - '{"username": "${Username}", "password": "${Password}", "engine": "postgres", "host": "${DBEndpoint}", "port": "${DBPort}", "dbClusterIdentifier": "${DBInstanceIdentifier}"}'
+        - Username: !Ref DBMasterUsername
+          Password: !Ref DBMasterUserPassword
+          DBEndpoint: !GetAtt RDSInstance.Endpoint.Address
+          DBPort: !GetAtt RDSInstance.Endpoint.Port
+      Tags:
+        - Key: Name
+          Value: !Sub "mcp-crawl4ai-${DBInstanceIdentifier}-secret"
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+  PrivateSubnetAId:
+    Description: Private Subnet A ID
+    Value: !Ref PrivateSubnetA
+  PrivateSubnetBId:
+    Description: Private Subnet B ID
+    Value: !Ref PrivateSubnetB
+  InternetGatewayId:
+    Description: Internet Gateway ID
+    Value: !Ref InternetGateway
+  RDSEndpointAddress:
+    Description: RDS instance endpoint address
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  RDSEndpointPort:
+    Description: RDS instance endpoint port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+  RDSSecurityGroupId:
+    Description: Security Group ID for the RDS instance
+    Value: !Ref RDSSecurityGroup
+  DBSubnetGroupName:
+    Description: DB Subnet Group Name
+    Value: !Ref DBSubnetGroup
+  DBSecretArn:
+    Description: ARN of the Secrets Manager secret for DB credentials
+    Value: !Ref DBSecret
+  DBInstanceName:
+    Description: Name of the RDS DB Instance
+    Value: !Ref RDSInstance
+  CurrentAccessIP:
+    Description: Current IP address with RDS access
+    Value: !Ref AccessCIDR 

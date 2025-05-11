@@ -8,20 +8,23 @@ from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
 from dotenv import load_dotenv
-from supabase import Client
 from pathlib import Path
+from urllib.parse import urlparse
 import requests
 import asyncio
 import json
 import os
 import re
+import aiohttp
+import time
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from utils import get_supabase_client, add_documents_to_supabase, search_documents
+from utils import get_db_connection, close_db_connection, add_documents_batch, search_documents
+from utils import smart_chunk_markdown, extract_section_info
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -35,8 +38,10 @@ load_dotenv(dotenv_path, override=True)
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
-    supabase_client: Client
-    
+
+# Add a global server_ready flag
+server_ready = False
+
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     """
@@ -46,29 +51,27 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         server: The FastMCP server instance
         
     Yields:
-        Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
+        Crawl4AIContext: The context containing the Crawl4AI crawler
     """
-    # Create browser configuration
+    global server_ready
     browser_config = BrowserConfig(
         headless=True,
         verbose=False
     )
-    
-    # Initialize the crawler
     crawler = AsyncWebCrawler(config=browser_config)
     await crawler.__aenter__()
-    
-    # Initialize Supabase client
-    supabase_client = get_supabase_client()
-    
+    server_ready = True  # Set ready flag after initialization
     try:
         yield Crawl4AIContext(
-            crawler=crawler,
-            supabase_client=supabase_client
+            crawler=crawler
         )
     finally:
-        # Clean up the crawler
+        server_ready = False
+        print("Shutting down: closing crawler...")
         await crawler.__aexit__(None, None, None)
+        print("Shutting down: closing database connection...")
+        close_db_connection()
+        print("Shutdown complete.")
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -125,70 +128,6 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
 
     return urls
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        # Calculate end position
-        end = start + chunk_size
-
-        # If we're at the end of the text, just take what's left
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
-
-        # Try to find a code block boundary first (```)
-        chunk = text[start:end]
-        code_block = chunk.rfind('```')
-        if code_block != -1 and code_block > chunk_size * 0.3:
-            end = start + code_block
-
-        # If no code block, try to break at a paragraph
-        elif '\n\n' in chunk:
-            # Find the last paragraph break
-            last_break = chunk.rfind('\n\n')
-            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_break
-
-        # If no paragraph break, try to break at a sentence
-        elif '. ' in chunk:
-            # Find the last sentence break
-            last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_period + 1
-
-        # Extract chunk and clean it up
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move start position for next chunk
-        start = end
-
-    return chunks
-
-def extract_section_info(chunk: str) -> Dict[str, Any]:
-    """
-    Extracts headers and stats from a chunk.
-    
-    Args:
-        chunk: Markdown chunk
-        
-    Returns:
-        Dictionary with headers and stats
-    """
-    headers = re.findall(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
-    header_str = '; '.join([f'{h[0]} {h[1]}' for h in headers]) if headers else ''
-
-    return {
-        "headers": header_str,
-        "char_count": len(chunk),
-        "word_count": len(chunk.split())
-    }
-
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
     """
@@ -207,7 +146,6 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
         
         # Configure the crawl
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
@@ -242,7 +180,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             url_to_full_document = {url: result.markdown}
             
             # Add to Supabase
-            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+            add_documents_batch(urls, chunk_numbers, contents, metadatas, url_to_full_document)
             
             return json.dumps({
                 "success": True,
@@ -290,9 +228,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         JSON string with crawl summary and storage information
     """
     try:
-        # Get the crawler and Supabase client from the context
+        # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
         
         crawl_results = []
         crawl_type = "webpage"
@@ -360,8 +297,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         
         # Add to Supabase
         # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
-        batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        batch_size = 50
+        add_documents_batch(urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         return json.dumps({
             "success": True,
@@ -486,24 +423,24 @@ async def get_available_sources(ctx: Context) -> str:
         JSON string with the list of available sources
     """
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the crawler from the context
+        crawler = ctx.request_context.lifespan_context.crawler
         
-        # Use a direct query with the Supabase client
+        # Use a direct query with the database
         # This could be more efficient with a direct Postgres query but
         # I don't want to require users to set a DB_URL environment variable as well
-        result = supabase_client.from_('crawled_pages')\
-            .select('metadata')\
-            .not_.is_('metadata->>source', 'null')\
-            .execute()
+        result = search_documents(
+            query="SELECT DISTINCT metadata->>source FROM crawled_pages WHERE metadata->>source IS NOT NULL",
+            match_count=None
+        )
             
         # Use a set to efficiently track unique sources
         unique_sources = set()
         
         # Extract the source values from the result using a set for uniqueness
-        if result.data:
-            for item in result.data:
-                source = item.get('metadata', {}).get('source')
+        if result:
+            for item in result:
+                source = item.get('source')
                 if source:
                     unique_sources.add(source)
         
@@ -540,9 +477,12 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     Returns:
         JSON string with the search results
     """
+    global server_ready
+    if not server_ready:
+        return json.dumps({"success": False, "error": "Server not ready. Please try again in a few seconds."})
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the crawler from the context
+        crawler = ctx.request_context.lifespan_context.crawler
         
         # Prepare filter if source is provided and not empty
         filter_metadata = None
@@ -551,7 +491,6 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         
         # Perform the search
         results = search_documents(
-            client=supabase_client,
             query=query,
             match_count=match_count,
             filter_metadata=filter_metadata
@@ -581,14 +520,226 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             "error": str(e)
         }, indent=2)
 
+@mcp.tool()
+async def crawl_github_repo(
+    ctx: Context,
+    repo_url: str,
+    max_depth: int = 3,
+    chunk_size: int = 5000,
+    github_token: Optional[str] = None,
+    branch: str = "main",
+    exclude_extensions: Optional[List[str]] = None,
+    exclude_filenames: Optional[List[str]] = None
+) -> str:
+    """
+    Crawl a GitHub repository and store its content in Supabase.
+    - If github_token is provided, uses the GitHub API (works for private and public repos, more efficient).
+    - If no github_token is provided, uses Crawl4AI's browser-based crawling (works for public repos, no API limits).
+    - In both cases, supports filtering by branch (API only), excluding files by extension or name, and chunking content for RAG.
+    - All chunks use extract_section_info for metadata consistency.
+    Args:
+        ctx: The MCP server provided context
+        repo_url: URL of the GitHub repository (e.g., https://github.com/user/repo)
+        max_depth: Maximum directory recursion depth (default: 3)
+        chunk_size: Maximum size of each content chunk in characters (default: 5000)
+        github_token: Optional GitHub token for private repos or higher rate limits
+        branch: Branch to crawl (default: "main")
+        exclude_extensions: List of file extensions to exclude (e.g., [".png", ".exe"])
+        exclude_filenames: List of file names to exclude (e.g., ["README.md", "LICENSE"])
+    Returns:
+        JSON string with crawl summary and storage information
+    """
+    crawler = ctx.request_context.lifespan_context.crawler
+    exclude_exts = set(exclude_extensions or [])
+    exclude_names = set(exclude_filenames or [])
+    github_token = os.getenv("GITHUB_TOKEN")
+    repo_url = repo_url.rstrip('/')
+    parsed = urlparse(repo_url)
+    path_parts = parsed.path.strip('/').split('/')
+    if len(path_parts) < 2:
+        return json.dumps({"success": False, "error": "Invalid GitHub repo URL"}, indent=2)
+    owner, repo = path_parts[:2]
+    
+    if github_token:
+        # --- API-based approach (private or public repos) ---
+        headers = {'Authorization': f'token {github_token}'}
+        async def fetch_github_file(session, raw_url, headers):
+            try:
+                async with session.get(raw_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    elif resp.status == 403:
+                        reset = resp.headers.get("X-RateLimit-Reset")
+                        if reset:
+                            wait_time = int(reset) - int(time.time())
+                            return f"RATE_LIMIT:{wait_time}"
+                        return None
+                    return None
+            except Exception as e:
+                return f"ERROR:{str(e)}"
+        async def list_github_files(session, owner, repo, path, headers, depth, max_depth, branch, exclude_exts, exclude_names):
+            if depth > max_depth:
+                return []
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+            try:
+                async with session.get(api_url, headers=headers) as resp:
+                    if resp.status == 403:
+                        reset = resp.headers.get("X-RateLimit-Reset")
+                        wait_time = int(reset) - int(time.time()) if reset else 60
+                        raise Exception(f"GitHub API rate limit exceeded. Try again in {wait_time} seconds.")
+                    if resp.status != 200:
+                        print(f"Error listing files at {api_url}: HTTP {resp.status}")
+                        return []
+                    try:
+                        items = await resp.json()
+                    except Exception as e:
+                        print(f"JSON decode error at {api_url}: {e}")
+                        return []
+                    files = []
+                    for item in items:
+                        name = item['name']
+                        ext = '.' + name.split('.')[-1] if '.' in name else ''
+                        if item['type'] == 'file':
+                            if (ext in exclude_exts) or (name in exclude_names):
+                                continue
+                            files.append(item['path'])
+                        elif item['type'] == 'dir':
+                            files.extend(
+                                await list_github_files(
+                                    session, owner, repo, item['path'], headers, depth+1, max_depth, branch, exclude_exts, exclude_names
+                                )
+                            )
+                    return files
+            except Exception as e:
+                print(f"Error listing files at {api_url}: {e}")
+                return []
+        async with aiohttp.ClientSession() as session:
+            all_files = await list_github_files(
+                session, owner, repo, "", headers, 0, max_depth, branch, exclude_exts, exclude_names
+            )
+            tasks = []
+            for file_path in all_files:
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+                tasks.append(fetch_github_file(session, raw_url, headers))
+            file_contents = await asyncio.gather(*tasks)
+        urls, chunk_numbers, contents, metadatas = [], [], [], []
+        url_to_full_document = {}
+        for file_path, text in zip(all_files, file_contents):
+            if not text or text.startswith("RATE_LIMIT:") or text.startswith("ERROR:"):
+                if text and text.startswith("RATE_LIMIT:"):
+                    print(f"Rate limit hit for {file_path}: wait {text.split(':')[1]} seconds")
+                elif text and text.startswith("ERROR:"):
+                    print(f"Error fetching {file_path}: {text}")
+                continue
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+            url_to_full_document[raw_url] = text
+            chunks = smart_chunk_markdown(text, chunk_size=chunk_size)
+            for i, chunk in enumerate(chunks):
+                meta = extract_section_info(chunk)
+                meta.update({
+                    "chunk_index": i,
+                    "url": raw_url,
+                    "source": f"github.com/{owner}/{repo}",
+                    "file_path": file_path,
+                    "repo": f"{owner}/{repo}",
+                    "branch": branch
+                })
+                urls.append(raw_url)
+                chunk_numbers.append(i)
+                contents.append(chunk)
+                metadatas.append(meta)
+        add_documents_batch(urls, chunk_numbers, contents, metadatas, url_to_full_document)
+        return json.dumps({
+            "success": True,
+            "repo": f"{owner}/{repo}",
+            "branch": branch,
+            "files_crawled": len(all_files),
+            "chunks_stored": len(contents),
+            "method": "api"
+        }, indent=2)
+    else:
+        # --- Browser-based Crawl4AI approach (public repos) ---
+        allowed_prefix = repo_url
+        def is_allowed_link(url):
+            return url.startswith(allowed_prefix)
+        async def crawl_recursive_github(crawler, start_urls, max_depth, allowed_prefix, exclude_exts, exclude_names):
+            visited = set()
+            current_urls = set(start_urls)
+            results_all = []
+            for depth in range(max_depth):
+                urls_to_crawl = [u for u in current_urls if u not in visited]
+                if not urls_to_crawl:
+                    break
+                try:
+                    crawl_results = await crawler.arun_many(urls=urls_to_crawl)
+                except Exception as e:
+                    print(f"Error crawling URLs at depth {depth}: {e}")
+                    continue
+                next_level_urls = set()
+                for result in crawl_results:
+                    visited.add(result.url)
+                    if not getattr(result, 'success', False):
+                        print(f"Failed to crawl {getattr(result, 'url', 'unknown')}: {getattr(result, 'error_message', 'Unknown error')}")
+                        continue
+                    if result.success and result.markdown:
+                        # Exclude by extension or filename (heuristic: check url path)
+                        path = urlparse(result.url).path
+                        name = path.split('/')[-1]
+                        ext = '.' + name.split('.')[-1] if '.' in name else ''
+                        if (ext in exclude_exts) or (name in exclude_names):
+                            continue
+                        results_all.append({'url': result.url, 'markdown': result.markdown})
+                        for link in result.links.get("internal", []):
+                            href = link.get("href")
+                            if href and href.startswith(allowed_prefix) and href not in visited:
+                                next_level_urls.add(href)
+                current_urls = next_level_urls
+            return results_all
+        crawl_results = await crawl_recursive_github(
+            crawler, [repo_url], max_depth, allowed_prefix, exclude_exts, exclude_names
+        )
+        urls, chunk_numbers, contents, metadatas = [], [], [], []
+        url_to_full_document = {}
+        for doc in crawl_results:
+            source_url = doc['url']
+            md = doc['markdown']
+            url_to_full_document[source_url] = md
+            chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+            for i, chunk in enumerate(chunks):
+                meta = extract_section_info(chunk)
+                meta.update({
+                    "chunk_index": i,
+                    "url": source_url,
+                    "source": urlparse(source_url).netloc,
+                    "repo_root": repo_url
+                })
+                urls.append(source_url)
+                chunk_numbers.append(i)
+                contents.append(chunk)
+                metadatas.append(meta)
+        add_documents_batch(urls, chunk_numbers, contents, metadatas, url_to_full_document)
+        return json.dumps({
+            "success": True,
+            "repo_url": repo_url,
+            "pages_crawled": len(crawl_results),
+            "chunks_stored": len(contents),
+            "method": "crawl4ai"
+        }, indent=2)
+
 async def main():
     transport = os.getenv("TRANSPORT", "sse")
-    if transport == 'sse':
-        # Run the MCP server with sse transport
-        await mcp.run_sse_async()
-    else:
-        # Run the MCP server with stdio transport
-        await mcp.run_stdio_async()
+    try:
+        if transport == 'sse':
+            await mcp.run_sse_async()
+        else:
+            await mcp.run_stdio_async()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("Received shutdown signal (KeyboardInterrupt or CancelledError). Cleaning up...")
+    finally:
+        print("Final cleanup (if needed) complete.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Force quit received. Exiting now.")

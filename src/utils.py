@@ -5,27 +5,89 @@ import os
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
-from supabase import create_client, Client
-from urllib.parse import urlparse
+import psycopg2
+import boto3
+from psycopg2.extras import Json, DictCursor
 import openai
+import re
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def get_supabase_client() -> Client:
-    """
-    Get a Supabase client with the URL and key from environment variables.
-    
-    Returns:
-        Supabase client instance
-    """
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY")
-    
-    if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
-    
-    return create_client(url, key)
+_db_conn: Optional[psycopg2.extensions.connection] = None
+
+def get_secret(secret_name: str, region_name: str) -> Dict[str, str]:
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager', region_name=region_name)
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+            return json.loads(secret)
+        else:
+            import base64
+            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+            return json.loads(decoded_binary_secret)
+    except Exception as e:
+        print(f"Error retrieving secret {secret_name}: {e}")
+        raise
+
+def get_db_connection() -> psycopg2.extensions.connection:
+    global _db_conn
+    if _db_conn and not _db_conn.closed:
+        return _db_conn
+
+    db_user, db_password, db_host, db_port_str, db_name_val = (None,) * 5
+    aws_secret_name = os.getenv("DB_SECRET_NAME")
+    aws_region = os.getenv("AWS_REGION")
+
+    if aws_secret_name and aws_region:
+        print(f"Fetching DB credentials from AWS Secrets Manager: {aws_secret_name}")
+        try:
+            secret_data = get_secret(aws_secret_name, aws_region)
+            db_user = secret_data.get('username')
+            db_password = secret_data.get('password')
+            db_host = secret_data.get('host')
+            db_port_str = str(secret_data.get('port', '5432'))
+            db_name_val = secret_data.get('dbname')
+        except Exception as e:
+            print(f"Failed to get credentials from Secrets Manager: {e}. Falling back to env vars if configured.")
+
+    if not all([db_user, db_password, db_host, db_port_str, db_name_val]):
+        missing = []
+        if not db_host: missing.append("DB_HOST")
+        if not db_port_str: missing.append("DB_PORT")
+        if not db_name_val: missing.append("DB_NAME")
+        if not db_user: missing.append("DB_USER")
+        if not db_password: missing.append("DB_PASSWORD")
+        if missing:
+            raise ValueError(
+                f"Database connection parameters missing: {', '.join(missing)}. "
+                "Please set them in your environment variables or AWS Secrets Manager."
+            )
+
+    try:
+        print(f"Connecting to database: host={db_host}, port={db_port_str}, dbname={db_name_val}, user={db_user}")
+        conn = psycopg2.connect(
+            host=db_host,
+            port=db_port_str,
+            dbname=db_name_val,
+            user=db_user,
+            password=db_password,
+        )
+        _db_conn = conn
+        return conn
+    except psycopg2.Error as e:
+        print(f"Error connecting to PostgreSQL database: {e}")
+        _db_conn = None
+        raise
+
+def close_db_connection():
+    global _db_conn
+    if _db_conn and not _db_conn.closed:
+        _db_conn.close()
+        _db_conn = None
+        print("Database connection closed.")
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
@@ -134,162 +196,183 @@ def process_chunk_with_context(args):
     url, content, full_document = args
     return generate_contextual_embedding(full_document, content)
 
-def add_documents_to_supabase(
-    client: Client, 
-    urls: List[str], 
+def safe_execute_values(cursor, query, data):
+    """
+    Helper for psycopg2.extras.execute_values that enforces VALUES %s pattern.
+    Raises ValueError if the query does not use VALUES %s.
+    """
+    if "VALUES %s" not in query:
+        raise ValueError("For execute_values, query must use VALUES %s")
+    from psycopg2.extras import execute_values
+    return execute_values(cursor, query, data)
+
+def add_documents_batch(
+    urls: List[str],
     chunk_numbers: List[int],
-    contents: List[str], 
+    contents: List[str],
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
     batch_size: int = 20
 ) -> None:
-    """
-    Add documents to the Supabase crawled_pages table in batches.
-    Deletes existing records with the same URLs before inserting to prevent duplicates.
-    
-    Args:
-        client: Supabase client
-        urls: List of URLs
-        chunk_numbers: List of chunk numbers
-        contents: List of document contents
-        metadatas: List of document metadata
-        url_to_full_document: Dictionary mapping URLs to their full document content
-        batch_size: Size of each batch for insertion
-    """
-    # Get unique URLs to delete existing records
-    unique_urls = list(set(urls))
-    
-    # Delete existing records for these URLs in a single operation
+    conn = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        unique_urls = list(set(urls))
         if unique_urls:
-            # Use the .in_() filter to delete all records with matching URLs
-            client.table("crawled_pages").delete().in_("url", unique_urls).execute()
+            print(f"Deleting existing records for {len(unique_urls)} URLs...")
+            delete_query = "DELETE FROM crawled_pages WHERE url = ANY(%s);"
+            cursor.execute(delete_query, (unique_urls,))
+            print(f"{cursor.rowcount} existing records deleted for specified URLs.")
+            conn.commit()
+        model_choice = os.getenv("MODEL_CHOICE")
+        use_contextual_embeddings = bool(model_choice)
+        total_inserted_count = 0
+        for i in range(0, len(contents), batch_size):
+            batch_end = min(i + batch_size, len(contents))
+            print(f"Processing DB batch {i//batch_size + 1}: items {i+1} to {batch_end}")
+            batch_urls_slice = urls[i:batch_end]
+            batch_chunk_numbers_slice = chunk_numbers[i:batch_end]
+            batch_contents_slice = contents[i:batch_end]
+            batch_metadatas_slice = metadatas[i:batch_end]
+            content_for_embedding = batch_contents_slice
+            if use_contextual_embeddings:
+                temp_contextual_contents = []
+                for j_idx, chunk_content in enumerate(batch_contents_slice):
+                    current_url = batch_urls_slice[j_idx]
+                    full_doc = url_to_full_document.get(current_url, "")
+                    contextual_text, _ = generate_contextual_embedding(full_doc, chunk_content)
+                    temp_contextual_contents.append(contextual_text)
+                content_for_embedding = temp_contextual_contents
+            batch_embeddings = create_embeddings_batch(content_for_embedding)
+            if not batch_embeddings or len(batch_embeddings) != len(content_for_embedding):
+                print(f"Warning: Embedding count mismatch for batch starting at index {i}. Expected {len(content_for_embedding)}, got {len(batch_embeddings) if batch_embeddings else 0}.")
+            batch_data_to_insert = []
+            for j in range(len(batch_contents_slice)):
+                if j >= len(batch_embeddings) or not batch_embeddings[j]:
+                    print(f"Skipping doc URL {batch_urls_slice[j]} chunk {batch_chunk_numbers_slice[j]} due to missing/failed embedding.")
+                    continue
+                current_metadata = batch_metadatas_slice[j] if batch_metadatas_slice and j < len(batch_metadatas_slice) else {}
+                data_tuple = (
+                    batch_urls_slice[j],
+                    batch_chunk_numbers_slice[j],
+                    batch_contents_slice[j],
+                    Json(current_metadata),
+                    batch_embeddings[j]
+                )
+                batch_data_to_insert.append(data_tuple)
+            if batch_data_to_insert:
+                # IMPORTANT: For execute_values, use VALUES %s (not VALUES (%s, %s, ...))
+                insert_query = """
+                    INSERT INTO crawled_pages (url, chunk_number, content, metadata, embedding)
+                    VALUES %s
+                    ON CONFLICT (url, chunk_number) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        metadata = EXCLUDED.metadata,
+                        embedding = EXCLUDED.embedding,
+                        created_at = timezone('utc'::text, now());
+                """
+                safe_execute_values(cursor, insert_query, batch_data_to_insert)
+                conn.commit()
+                total_inserted_count += len(batch_data_to_insert)
+                print(f"DB Batch {i//batch_size + 1}: Inserted/Updated {len(batch_data_to_insert)} records.")
+        print(f"Successfully inserted/updated {total_inserted_count} total records.")
+    except psycopg2.Error as e:
+        print(f"Database error in add_documents_batch: {e}")
+        if conn: conn.rollback()
+        raise 
     except Exception as e:
-        print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
-        # Fallback: delete records one by one
-        for url in unique_urls:
-            try:
-                client.table("crawled_pages").delete().eq("url", url).execute()
-            except Exception as inner_e:
-                print(f"Error deleting record for URL {url}: {inner_e}")
-                # Continue with the next URL even if one fails
-    
-    # Check if MODEL_CHOICE is set for contextual embeddings
-    model_choice = os.getenv("MODEL_CHOICE")
-    use_contextual_embeddings = bool(model_choice)
-    
-    # Process in batches to avoid memory issues
-    for i in range(0, len(contents), batch_size):
-        batch_end = min(i + batch_size, len(contents))
-        
-        # Get batch slices
-        batch_urls = urls[i:batch_end]
-        batch_chunk_numbers = chunk_numbers[i:batch_end]
-        batch_contents = contents[i:batch_end]
-        batch_metadatas = metadatas[i:batch_end]
-        
-        # Apply contextual embedding to each chunk if MODEL_CHOICE is set
-        if use_contextual_embeddings:
-            # Prepare arguments for parallel processing
-            process_args = []
-            for j, content in enumerate(batch_contents):
-                url = batch_urls[j]
-                full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
-            
-            # Process in parallel using ThreadPoolExecutor
-            contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Submit all tasks and collect results
-                future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
-                                for idx, arg in enumerate(process_args)}
-                
-                # Process results as they complete
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        result, success = future.result()
-                        contextual_contents.append(result)
-                        if success:
-                            batch_metadatas[idx]["contextual_embedding"] = True
-                    except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
-                        # Use original content as fallback
-                        contextual_contents.append(batch_contents[idx])
-            
-            # Sort results back into original order if needed
-            if len(contextual_contents) != len(batch_contents):
-                print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
-                # Use original contents as fallback
-                contextual_contents = batch_contents
-        else:
-            # If not using contextual embeddings, use original contents
-            contextual_contents = batch_contents
-        
-        # Create embeddings for the entire batch at once
-        batch_embeddings = create_embeddings_batch(contextual_contents)
-        
-        batch_data = []
-        for j in range(len(contextual_contents)):
-            # Extract metadata fields
-            chunk_size = len(contextual_contents[j])
-            
-            # Prepare data for insertion
-            data = {
-                "url": batch_urls[j],
-                "chunk_number": batch_chunk_numbers[j],
-                "content": contextual_contents[j],  # Store original content
-                "metadata": {
-                    "chunk_size": chunk_size,
-                    **batch_metadatas[j]
-                },
-                "embedding": batch_embeddings[j]  # Use embedding from contextual content
-            }
-            
-            batch_data.append(data)
-        
-        # Insert batch into Supabase
-        try:
-            client.table("crawled_pages").insert(batch_data).execute()
-        except Exception as e:
-            print(f"Error inserting batch into Supabase: {e}")
+        print(f"General error in add_documents_batch: {e}")
+        if conn: conn.rollback()
+        raise
 
 def search_documents(
-    client: Client, 
-    query: str, 
-    match_count: int = 10, 
+    query: str,
+    match_count: int = 5,
     filter_metadata: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
-    """
-    Search for documents in Supabase using vector similarity.
-    
-    Args:
-        client: Supabase client
-        query: Query text
-        match_count: Maximum number of results to return
-        filter_metadata: Optional metadata filter
-        
-    Returns:
-        List of matching documents
-    """
-    # Create embedding for the query
-    query_embedding = create_embedding(query)
-    
-    # Execute the search using the match_crawled_pages function
+    conn = None
     try:
-        # Only include filter parameter if filter_metadata is provided and not empty
-        params = {
-            'query_embedding': query_embedding,
-            'match_count': match_count
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        query_embedding = create_embedding(query)
+        if not query_embedding:
+            print("Failed to generate query embedding for search.")
+            return []
+        params_for_sql = {
+            'p_query_embedding': query_embedding,
+            'p_match_count': match_count,
+            'p_filter': Json(filter_metadata if filter_metadata else {})
         }
-        
-        # Only add the filter if it's actually provided and not empty
-        if filter_metadata:
-            params['filter'] = filter_metadata  # Pass the dictionary directly, not JSON-encoded
-        
-        result = client.rpc('match_crawled_pages', params).execute()
-        
-        return result.data
-    except Exception as e:
-        print(f"Error searching documents: {e}")
+        sql_function_call = "SELECT * FROM match_crawled_pages(%(p_query_embedding)s::vector, %(p_match_count)s, %(p_filter)s);"
+        cursor.execute(sql_function_call, params_for_sql)
+        results = cursor.fetchall()
+        return [dict(row) for row in results]
+    except psycopg2.Error as e:
+        print(f"Database error in search_documents: {e}")
+        if conn: conn.rollback()
         return []
+    except Exception as e:
+        print(f"General error in search_documents: {e}")
+        return []
+
+def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> list:
+    """Split text into chunks, respecting code blocks and paragraphs."""
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        # Calculate end position
+        end = start + chunk_size
+
+        # If we're at the end of the text, just take what's left
+        if end >= text_length:
+            chunks.append(text[start:].strip())
+            break
+
+        # Try to find a code block boundary first (```)
+        chunk = text[start:end]
+        code_block = chunk.rfind('```')
+        if code_block != -1 and code_block > chunk_size * 0.3:
+            end = start + code_block
+
+        # If no code block, try to break at a paragraph
+        elif '\n\n' in chunk:
+            # Find the last paragraph break
+            last_break = chunk.rfind('\n\n')
+            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_break
+
+        # If no paragraph break, try to break at a sentence
+        elif '. ' in chunk:
+            # Find the last sentence break
+            last_period = chunk.rfind('. ')
+            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_period + 1
+
+        # Extract chunk and clean it up
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Move start position for next chunk
+        start = end
+
+    return chunks
+
+def extract_section_info(chunk: str) -> dict:
+    """
+    Extracts headers and stats from a chunk.
+    Args:
+        chunk: Markdown chunk
+    Returns:
+        Dictionary with headers and stats
+    """
+    headers = re.findall(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
+    header_str = '; '.join([f'{h[0]} {h[1]}' for h in headers]) if headers else ''
+    return {
+        "headers": header_str,
+        "char_count": len(chunk),
+        "word_count": len(chunk.split())
+    }
